@@ -34,6 +34,12 @@ CAMERA_URL = os.environ.get(
     "http://10.0.3.157:8081/stream.mjpg"
 )
 QUALITE_JPEG = 80
+
+FPS_ANALYSE = 5
+FPS_FLUX = 10
+LARGEUR_MAX = 640
+INTERVALLE_API = 1.0
+
 AIDE_CAMERA = (
     "Caméra indisponible — autoriser Python : "
     "Réglages > Confidentialité et sécurité > Caméra"
@@ -121,7 +127,7 @@ def serveur_web():
 def lire_arret():
     global start
 
-    response_arret = requests.get(f"{url_get_stop}?limit=1")
+    response_arret = requests.get(f"{url_get_stop}?limit=1", timeout=2)
     response_arret.raise_for_status()
 
     donnees = response_arret.json()
@@ -135,7 +141,10 @@ def lire_arret():
 def lire_depart():
     global start
 
-    response = requests.get(f"{url_get_start}?limit=1")
+    response = requests.get(
+    f"{url_get_start}?limit=1",
+    timeout=2
+)
     response.raise_for_status()
 
     donnees = response.json()
@@ -209,110 +218,236 @@ def lire_flux_mjpeg(url):
             if image is not None:
                 yield image
 
+
 def main():
+    cv2.setNumThreads(1)
+
     threading.Thread(target=serveur_web, daemon=True).start()
-    
-    print(f"Flux IA  : http://localhost:{PORT}/stream.mjpg")
-    print(f"Compteur    : http://localhost:{PORT}/nombre_personnes")
-    print(f"Camera source   : {CAMERA_URL}")
+
+    print(f"Flux IA : http://localhost:{PORT}/stream.mjpg")
+    print(f"Compteur : http://localhost:{PORT}/nombre_personnes")
+    print(f"Caméra source : {CAMERA_URL}")
 
     flux_camera = None
     aide_affichee = False
+    en_veille = False
+
+    dernier_nombre_personne = 0
+    derniers_rectangles = []
+
+    dernier_temps_analyse = 0.0
+    dernier_temps_publication = 0.0
+    dernier_poll_api = 0.0
+    dernier_message_api = 0.0
+
+    intervalle_analyse = 1.0 / FPS_ANALYSE
+    intervalle_flux = 1.0 / FPS_FLUX
 
     with mp.solutions.face_detection.FaceDetection(
+        model_selection=0,
         min_detection_confidence=0.5
     ) as face_detection:
         try:
             while True:
+                maintenant = time.monotonic()
+
+                # Interroger le backend une seule fois par seconde
+                if maintenant - dernier_poll_api >= INTERVALLE_API:
+                    dernier_poll_api = maintenant
+
+                    for lecture in (lire_depart, lire_arret):
+                        try:
+                            lecture()
+                        except (
+                            requests.RequestException,
+                            ValueError,
+                            KeyError,
+                            TypeError
+                        ) as erreur:
+                            maintenant = time.monotonic()
+
+                            if maintenant - dernier_message_api >= 10:
+                                print(
+                                    f"Erreur API : {erreur}",
+                                    flush=True
+                                )
+                                dernier_message_api = maintenant
+
+                # Mettre l'analyse en pause tout en continuant
+                # à vérifier les commandes du backend.
                 if start:
-                    flux_camera = None
-                    veille()
-                    time.sleep(1)
+                    if flux_camera is not None:
+                        flux_camera.close()
+                        flux_camera = None
+
+                    if not en_veille:
+                        veille()
+                        en_veille = True
+
+                    time.sleep(0.1)
                     continue
 
-                # Ouverture paresseuse : la caméra n'est touchée qu'en marche,
-                # sinon une permission refusée tuerait le serveur du flux.
+                en_veille = False
+
+                # Connexion au flux MJPEG
                 if flux_camera is None:
                     flux_camera = lire_flux_mjpeg(CAMERA_URL)
+
                 try:
                     frame = next(flux_camera)
-                    
+
                 except StopIteration:
+                    flux_camera.close()
                     flux_camera = None
                     signaler_erreur("Le flux caméra est terminé")
-                    time.sleep(1)
+                    time.sleep(0.5)
                     continue
-                    
+
                 except requests.RequestException as erreur:
-                    flux_camera = None
+                    if flux_camera is not None:
+                        flux_camera.close()
+                        flux_camera = None
+
                     signaler_erreur(
                         f"Impossible d'accéder au flux caméra : {erreur}"
                     )
 
                     if not aide_affichee:
-                        print(
-                            f"Impossible d'accéder à la caméra : {erreur}",
-                            flush=True
-                        )
+                        print(f"Erreur caméra : {erreur}", flush=True)
                         aide_affichee = True
-                        
-                    time.sleep(2)
-                    continue    
 
+                    time.sleep(1)
+                    continue
 
                 except Exception as erreur:
-                    flux_camera = None
+                    if flux_camera is not None:
+                        flux_camera.close()
+                        flux_camera = None
+
                     signaler_erreur(
-                        f"Erreur inattendue lors de la lecture du flux caméra : {erreur}"
+                        f"Erreur de lecture vidéo : {erreur}"
                     )
-                    time.sleep(2)
+                    print(f"Erreur vidéo : {erreur}", flush=True)
+                    time.sleep(1)
                     continue
 
                 if aide_affichee:
                     print("Caméra opérationnelle", flush=True)
                     aide_affichee = False
 
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                resultats = face_detection.process(frame_rgb)
-                compte_visage = 0
+                # Réduire la résolution pour économiser du CPU
+                hauteur, largeur = frame.shape[:2]
 
-                if resultats.detections:
-                    for detection in resultats.detections:
-                        compte_visage += 1
+                if largeur > LARGEUR_MAX:
+                    nouvelle_hauteur = max(
+                        1,
+                        int(hauteur * LARGEUR_MAX / largeur)
+                    )
 
-                        box = detection.location_data.relative_bounding_box
-                        ih, iw, _ = frame.shape
-                        x, y = int(box.xmin * iw), int(box.ymin * ih)
-                        w, h = int(box.width * iw), int(box.height * ih)
-                        cv2.rectangle(frame, (x, y), (x + w, y + h), (225, 0, 0), 4)
+                    frame = cv2.resize(
+                        frame,
+                        (LARGEUR_MAX, nouvelle_hauteur),
+                        interpolation=cv2.INTER_AREA
+                    )
 
-                # Une seule personne reconnue -> cliché pour l'IA / les preuves
-                if compte_visage == 1:
-                    cv2.imwrite("captured_image.jpeg", frame)
+                maintenant = time.monotonic()
 
-                donnees = {"nombrePersonne": compte_visage}
+                # Détection des visages à 5 FPS maximum
+                if maintenant - dernier_temps_analyse >= intervalle_analyse:
+                    dernier_temps_analyse = maintenant
 
-                envoi = requests.post(
-                    url_post,
-                    json=donnees
-                )
-                envoi.raise_for_status()
+                    frame_rgb = cv2.cvtColor(
+                        frame,
+                        cv2.COLOR_BGR2RGB
+                    )
 
-                # Diffusion du flux vers le dashboard
-                publier(frame, compte_visage)
+                    resultats = face_detection.process(frame_rgb)
+
+                    compte_visage = 0
+                    rectangles = []
+
+                    hauteur, largeur = frame.shape[:2]
+
+                    if resultats.detections:
+                        for detection in resultats.detections:
+                            compte_visage += 1
+
+                            box = (
+                                detection.location_data
+                                .relative_bounding_box
+                            )
+
+                            x = max(0, int(box.xmin * largeur))
+                            y = max(0, int(box.ymin * hauteur))
+                            x2 = min(
+                                largeur,
+                                x + int(box.width * largeur)
+                            )
+                            y2 = min(
+                                hauteur,
+                                y + int(box.height * hauteur)
+                            )
+
+                            rectangles.append((x, y, x2, y2))
+
+                    # Capturer et notifier uniquement lors du passage
+                    # à exactement une personne détectée.
+                    nouvelle_detection = (
+                        compte_visage == 1
+                        and dernier_nombre_personne != 1
+                    )
+
+                    dernier_nombre_personne = compte_visage
+                    derniers_rectangles = rectangles
+
+                    if nouvelle_detection:
+                        cv2.imwrite("captured_image.jpeg", frame)
+
+                        try:
+                            envoi = requests.post(
+                                url_post,
+                                json={"nombrePersonne": compte_visage},
+                                timeout=2
+                            )
+                            envoi.raise_for_status()
+
+                        except requests.RequestException as erreur:
+                            print(
+                                f"Erreur envoi personnes : {erreur}",
+                                flush=True
+                            )
+
+                # Réutiliser la dernière détection sur les images
+                # intermédiaires, sans relancer MediaPipe.
+                for x, y, x2, y2 in derniers_rectangles:
+                    cv2.rectangle(
+                        frame,
+                        (x, y),
+                        (x2, y2),
+                        (225, 0, 0),
+                        2
+                    )
+
+                # Limiter l'encodage et la publication du flux à 10 FPS
+                maintenant = time.monotonic()
+
+                if maintenant - dernier_temps_publication >= intervalle_flux:
+                    publier(frame, dernier_nombre_personne)
+                    dernier_temps_publication = maintenant
 
                 if FENETRE:
                     cv2.imshow("cam", frame)
+
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         break
-                lire_depart()
-                lire_arret()
+
         finally:
-            flux_camera = None
-                
+            if flux_camera is not None:
+                flux_camera.close()
+
             if FENETRE:
                 cv2.destroyAllWindows()
-                
+
             veille()
 
 

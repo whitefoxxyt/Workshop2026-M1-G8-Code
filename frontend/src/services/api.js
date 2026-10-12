@@ -1,5 +1,5 @@
 const API_BASE = (
-  import.meta.env.VITE_API_URL || "http://localhost:3000/api"
+  import.meta.env.VITE_API_URL || "http://backend:3000/api"
 ).replace(/\/$/, "");
 
 /*
@@ -9,7 +9,7 @@ const API_BASE = (
   - une URL mp4/m3u8 -> lue avec <video>, sinon MJPEG avec <img>
 */
 const CAMERA_STREAM_URL =
-  import.meta.env.VITE_CAMERA_URL ?? "http://10.0.3.157:8081/stream.mjpg";
+  import.meta.env.VITE_CAMERA_URL ?? "/camera/stream.mjpg";
 
 const COMMANDS_API_URL = import.meta.env.VITE_COMMANDS_API_URL || `${API_BASE}/v1/commandes`;
 
@@ -79,8 +79,15 @@ export const sendCommand = async (action) => {
 
 /* ------------------------------- Caméra -------------------------------- */
 
-const cameraEndpoint = (path) =>
-  new URL(path, CAMERA_STREAM_URL).toString();
+const cameraEndpoint = (path) => {
+  if (/^https?:\/\//i.test(CAMERA_STREAM_URL)) {
+    return new URL(path, CAMERA_STREAM_URL).toString();
+  }
+
+  const origin = typeof window === "undefined" ? "" : window.location.origin;
+  const base = CAMERA_STREAM_URL.replace(/\/stream\.mjpg(?:\?.*)?$/, "");
+  return `${origin}${base}${path}`;
+};
 
 /*
   État du module IA : personnes détectées + caméra active ou en veille.

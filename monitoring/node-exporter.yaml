@@ -15,21 +15,15 @@ spec:
         app: node-exporter
 
     spec:
-      hostNetwork: true
-      hostPID: true
-
       containers:
         - name: node-exporter
           image: prom/node-exporter:latest
 
           args:
             - "--path.rootfs=/host"
-            - "--path.procfs=/host/proc"
-            - "--path.sysfs=/host/sys"
 
           ports:
             - containerPort: 9100
-              hostPort: 9100
 
           volumeMounts:
             - name: rootfs
@@ -37,28 +31,10 @@ spec:
               readOnly: true
               mountPropagation: HostToContainer
 
-            - name: proc
-              mountPath: /host/proc
-              readOnly: true
-
-            - name: sys
-              mountPath: /host/sys
-              readOnly: true
-
       volumes:
         - name: rootfs
           hostPath:
             path: /
-            type: Directory
-
-        - name: proc
-          hostPath:
-            path: /proc
-            type: Directory
-
-        - name: sys
-          hostPath:
-            path: /sys
             type: Directory
 
 ---

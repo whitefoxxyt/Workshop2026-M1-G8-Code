@@ -30,7 +30,7 @@ spec:
               value: "http://backend:3000/api"
 
             - name: VITE_CAMERA_URL
-              value: "http://ia:8080"
+              value: "stream.mjpg"
 
             - name: VITE_COMMANDS_API_URL
               value: "http://backend:3000/api/v1/commandes"
